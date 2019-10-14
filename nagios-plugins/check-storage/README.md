@@ -11,7 +11,7 @@
 
 ###### -  ZFS pools
 
-###### -  It will also monitor all the drives detected in non-RAID / non-ZFS (or mixed) enviroments.
+###### -  It will also monitor all the drives (via smartctl) detected in non-RAID / non-ZFS (or mixed) enviroments.
 
 
 
