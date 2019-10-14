@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Nagios plugin for Software and Hardware RAID; asmo@conseev
+# Nagios plugin for Software/Hardware RAID and non-RAID storages; asmo@conseev
 #
 # Supported RAID controllers: LSI, 3ware, Areca, Adaptec
 # notes:
@@ -8,10 +8,10 @@
 #	- For Adaptec - pcre2grep tool (pcre.org) is required for SMART regexp
 #	- For Adaptec - compat-libstdc++ package is required, CLI is dynamically linked
 #
-# usage: ./check-raid
-#	 ./check-raid show_error_counters    # display counters of critical events
+# usage: ./check-storage
+#	 ./check-storage show_error_counters    # display counters of critical events
 #
-# v0.1(6) - 04-07-2019
+# v0.3(2) - 23-08-2019
 #
 ###
 
@@ -36,7 +36,7 @@ function lsi_hw_raid_check() {
 	# amount of RAID controllers
 	ctl_ids=$(cat /dev/shm/.hwr_ctl.tmp|awk '/^-------+$/ && a++ {next}; a == 2')
 
-	echo -n "[LSI]::"
+	echo -n "[STORAGE][LSI]::"
 	# Check every available controller
 	while read -r current_ctl; do
 
@@ -47,7 +47,7 @@ function lsi_hw_raid_check() {
 		# anything else than 'Opt' state is considered critical
 		current_ctl_hlth=$(echo ${current_ctl}|grep -oE '[^ ]+$')
 
-		if [[ "${current_ctl_hlth}" = "Opt" ]]; then
+		if [[ "${current_ctl_hlth}" = "Opt" ]] || [[ "${current_ctl_hlth}" = "NdAtn" ]]; then
 			echo -n "Health: OK (${current_ctl_hlth});;"
 		  else
 			echo -n "Health: CRITICAL (${current_ctl_hlth});;"
@@ -95,7 +95,7 @@ function lsi_hw_raid_check() {
 
 				if [[ -z ${err_bbm} ]]; then err_bbm=NA; fi
 
-				if [[ ${err_media} -eq 0 ]] && [[ ${err_bbm}  -eq 0 ]]; then
+				if [[ ! ${err_media} -gt ${max_media_err_cnt} ]] && [[ ${err_bbm}  -eq 0 ]]; then
 					echo -n "drv: ${current_drive} - OK (ERR count(Media/BBM): ${err_media}/${err_bbm});"
 				  else
 					echo -n "drv: ${current_drive} - CRITICAL (ERR count(Media/BBM): ${err_media}/${err_bbm});"
@@ -109,7 +109,7 @@ function lsi_hw_raid_check() {
 			drive_ids=$(${r_cli} /c${current_ctl_id}/eALL/sALL show all|grep "^Drive .* State :$"|awk '{print $2}')
 			lsi_hw_raid_check_drives
 		fi
-		if [[ $"non_enc_drives}" != "No drive found!" ]]; then
+		if [[ "${non_enc_drives}" != "No drive found!" ]]; then
 			drive_ids=$(${r_cli} /c${current_ctl_id}/sALL show all|grep "^Drive .* State :$"|awk '{print $2}')
 			lsi_hw_raid_check_drives
 		fi
@@ -131,7 +131,7 @@ function areca_hw_raid_check() {
 	# amount of RAID controllers
 	ctl_ids=$(${r_cli} hw info|grep "^\[Enclosure#"|awk '{print $1}'|cut -d'#' -f2)
 
-	echo -n "[Areca]::"
+	echo -n "[STORAGE][Areca]::"
 	# Check every available controller
 	while read -r current_ctl; do
 
@@ -221,7 +221,7 @@ function areca_hw_raid_check() {
 			cur_drive_media=$(grep "^Media Error Count" /dev/shm/.curr_disk_hlth.tmp|awk -F": " '{print $2}')
 			cur_drive_state=$(grep "^Device State" /dev/shm/.curr_disk_hlth.tmp|awk -F": " '{print $2}')
 
-			if [[ ${cur_drive_media} -eq 0 ]] && [[ "${cur_drive_state}" = "NORMAL" ]]; then
+			if [[ ! ${cur_drive_media} -gt ${max_media_err_cnt} ]] && [[ "${cur_drive_state}" = "NORMAL" ]]; then
 				echo -n "drv: ${cur_drive_loc} - OK (ERR count/State: ${cur_drive_media}/${cur_drive_state});"
 			  else
 				echo -n "drv: ${cur_drive_loc} - CRITICAL (ERR count/State: ${cur_drive_media}/${cur_drive_state});"
@@ -245,7 +245,7 @@ function 3ware_hw_raid_check() {
 	# amount of RAID controllers
 	ctl_ids=$(${r_cli} show|awk '/^----+$+/ && a++ {next}; a == 1'|grep "^----" -v|sed '/^$/d')
 
-	echo -n "[3Ware]::"
+	echo -n "[STORAGE][3Ware]::"
 	# check every available controller
 	while read -r current_ctl; do
 
@@ -284,7 +284,7 @@ function 3ware_hw_raid_check() {
 		done <<< "${unit_list}"
 
 		# check all drives status, critical if not 'OK', pos 2
-		${r_cli} /${current_ctl_id} show drivestatus|awk '/^----+$+/ && a++ {next}; a == 1'|grep "^----" -v | \
+		${r_cli} /${current_ctl_id} show drivestatus|grep NOT-PRESENT -v|awk '/^----+$+/ && a++ {next}; a == 1'|grep "^----" -v | \
 			sed '/^$/d'|sed 's/ GB /GB /g' >/dev/shm/.3w_drive_list.tmp
 		drive_list=$(cat /dev/shm/.3w_drive_list.tmp)
 
@@ -297,7 +297,7 @@ function 3ware_hw_raid_check() {
 
 			echo -n "Drive: ${drive_vport}: "
 
-			if [[ "${drive_state}" = "OK" ]] && [[ ! ${rasect_cnt} -gt ${max_realloc_cnt} ]]; then
+			if [[ "${drive_state}" = "OK" ]] || [[ "${drive_state}" = "VERIFYING" ]] && [[ ! ${rasect_cnt} -gt ${max_realloc_cnt} ]]; then
 				echo -n "Health: OK (Status/ReallocSect: ${drive_state}/${rasect_cnt}, VPort/Size/Type: ${drive_vport}/${drive_size}GB/${drive_type});;"
 			  else
 				echo -n "Health: CRITICAL (Status/ReallocSect: ${drive_state}/${rasect_cnt}, VPort/Size/Type: ${drive_vport}/${drive_size}GB/${drive_type});;"
@@ -331,7 +331,7 @@ function adaptec_hw_raid_check() {
 		fi
 	done
 
-	echo -n "[Adaptec]::"
+	echo -n "[STORAGE][Adaptec]::"
 	# check every available controller
 	for current_ctl in $(echo ${ctl_ids[@]}); do
 
@@ -442,7 +442,7 @@ function software_raid_check() {
 	sw_arrays=$(grep -o "^md[_,a-z,0-9]*" /proc/mdstat)
 
 
-	echo -n "[SWR]::"
+	echo -n "[STORAGE][SWR]::"
 	while read -r current_array; do
 
 		${r_cli} -D /dev/${current_array} >/dev/shm/.sw_carray.tmp
@@ -466,6 +466,47 @@ function software_raid_check() {
 		fi
 
 	done <<< "${sw_arrays}"
+}
+
+function check_zfs_pools() {
+	if [[ -x ${bin_zpool} ]]; then
+
+		zfs_pools=$(${bin_zpool} list -H -o name,size,health)
+		if [[ ! -z ${zfs_pools} ]]; then
+			echo -n "[ZFS]::"
+
+			while read -r current_pool; do
+
+				# get pool details
+				pool_name=$(echo ${current_pool}|awk '{print $1}') ; pool_size=$(echo ${current_pool}|awk '{print $2}')
+				pool_health=$(echo ${current_pool}|awk '{print $3}')
+
+				if [[ "${pool_health}" = "ONLINE" ]]; then
+					echo -n "Health: OK (name/size/health: ${pool_name}/${pool_size}/${pool_health});"
+				  else
+					echo -n "Health: CRITICAL (name/size/health: ${pool_name}/${pool_size}/${pool_health});"
+					let is_critical+=1
+				fi
+
+			done <<< "${zfs_pools}"
+
+		  else
+			true
+		fi
+	  else
+		true
+	fi
+}
+
+
+function check_drives() {
+	# smartctl shipped with CentOS 5.7 (ie vpsnode1) doesn't have --scan option
+	valid_sctl=$(${bin_smartctl} -h|grep scan$)
+	if [[ -z ${valid_sctl} ]]; then
+		echo -n "* * * drive checks skipped, no --scan support in smartctl, please update smartmontools * * *"
+		let is_critical+=1
+		nagios_states
+	fi
 
 	# default IDs
 	${bin_smartctl} --scan|awk '{print $1}' >/dev/shm/.sw_drv_list.tmp
@@ -491,6 +532,11 @@ function software_raid_check() {
 	fi
 
 	# check SMART 'Reallocated_Sector_Ct|Retired_Block_Count' value
+	function check_sattr() {
+		if [[ -z ${err_realloc} ]]; then err_realloc="S_NOATTR"; fi
+	}
+
+	echo -n "[STORAGE]"
 	while read -r current_drive; do
 
 		if [[ ${sctl} = "3ware" ]]; then
@@ -500,6 +546,7 @@ function software_raid_check() {
 
 			if [[ -z "${is_smart}" ]]; then
 				err_realloc=$(${bin_smartctl} -d 3ware,${current_drive} -a /dev/tw?0|egrep '(Reallocated_Sector_Ct|Retired_Block_Count)'|awk '{print $NF}')
+				check_sattr
 			  else
 				err_realloc="SMART_disabled"
 			fi
@@ -511,6 +558,7 @@ function software_raid_check() {
 
 			if [[ -z "${is_smart}" ]]; then
 				err_realloc=$(${bin_smartctl} -a ${current_drive} |egrep '(Reallocated_Sector_Ct|Retired_Block_Count)'|awk '{print $NF}')
+				check_sattr
 			  else
 				err_realloc="SMART_disabled"
 			fi
@@ -527,6 +575,7 @@ function software_raid_check() {
 					err_realloc=$(echo $(smartctl -a ${current_drive} |egrep '(^read:|^write:)'|awk '{print $NF}')|sed 's/ /+/g'|bc)
 				  else
 					err_realloc=$(${bin_smartctl} -a ${current_drive} |egrep '(Reallocated_Sector_Ct|Retired_Block_Count)'|awk '{print $NF}')
+					check_sattr
 				fi
 			  else
 				err_realloc="SMART_disabled"
@@ -574,19 +623,26 @@ function nagios_states() {
 
 ## Main ##
 
-bin_lspci=$(which lspci)
+bin_lspci=$(which 2>/dev/null lspci)
+bin_zpool=$(which 2>/dev/null zpool)
 
 max_realloc_cnt=49
+max_media_err_cnt=49
+
 if [[ ! -x ${bin_lspci} ]]; then
         echo "fatal: unable to find lspci tool on $PATH, please install it, exiting" ; exit 2
 fi
 
 sw_arrays=$(grep -o "^md[_,a-z,0-9]*" /proc/mdstat)
+bin_smartctl=$(which 2>/dev/null smartctl)
+if [[ -z ${bin_smartctl} ]]; then
+	echo "smartctl missing, exiting" ; exit 1
+fi
 if [[ ! -z ${sw_arrays} ]]; then
 
-	bin_mdadm=$(which mdadm) ; bin_smartctl=$(which smartctl)
-	if [[ -z ${bin_mdadm} ]] || [[ -z ${bin_smartctl} ]]; then
-		echo "mdadm and/or smartctl missing, exiting" ; exit 1
+	bin_mdadm=$(which 2>/dev/null mdadm)
+	if [[ -z ${bin_mdadm} ]]; then
+		echo "mdadm missing, exiting" ; exit 1
 	fi
 fi
 
@@ -605,6 +661,8 @@ if [[ ${hw_card_present} -gt 0 ]]; then
 		# LSI on some hosts require '-d megaraid,N' for smartctl
 		sctl=lsi
 		check_sw_raid_if_found
+		check_zfs_pools
+		check_drives
 		   sw_errcnt=${is_critical}
 		nagios_states
 
@@ -614,6 +672,8 @@ if [[ ${hw_card_present} -gt 0 ]]; then
 		areca_hw_raid_check
 		   hw_errcnt=${is_critical}
 		check_sw_raid_if_found
+		check_zfs_pools
+		check_drives
 		   sw_errcnt=${is_critical}
 		nagios_states
 
@@ -624,30 +684,41 @@ if [[ ${hw_card_present} -gt 0 ]]; then
 		# 3ware require '-d 3ware,N' for smartctl
 		sctl=3ware
 		check_sw_raid_if_found
+		check_zfs_pools
+		check_drives
 		   sw_errcnt=${is_critical}
 		nagios_states
 
 	  elif [[ ${hw_card_model} = "Adaptec" ]]; then
 
-		bin_p2g=$(which pcre2grep)
+		bin_p2g=$(which 2>/dev/null pcre2grep)
 		if [[ ! -x ${bin_p2g} ]]; then
 		        echo "fatal: unable to find pcre2grep tool on $PATH, please install it, exiting" ; exit 2
 		  else
 			adaptec_hw_raid_check
 			   hw_errcnt=${is_critical}
 			check_sw_raid_if_found
+			check_zfs_pools
+			check_drives
 			   sw_errcnt=${is_critical}
 			nagios_states
 		fi
 
 	  else  echo -n "[HWR]:Found unsupported RAID card ;; "
 		check_sw_raid_if_found
+		check_zfs_pools
+		check_drives
 		   sw_errcnt=${is_critical}
 		nagios_states
 
 	fi
   else
+	# drive checks has been separated from software_raid_check() and check_drives() created instead
+	# for drive checks on non-RAID setups
 	check_sw_raid_if_found
+	if [[ -z ${is_critical} ]]; then is_critical=0 ; fi
+	check_zfs_pools
+	check_drives
 	  sw_errcnt=${is_critical}
 	nagios_states
 fi
