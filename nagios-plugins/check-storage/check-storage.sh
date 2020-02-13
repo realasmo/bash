@@ -11,7 +11,7 @@
 # usage: ./check-storage
 #	 ./check-storage show_error_counters    # display counters of critical events
 #
-# v0.3(2) - 23-08-2019
+# v0.4(4) - 22-01-2020
 #
 ###
 
@@ -27,11 +27,17 @@ function lsi_hw_raid_check() {
 	is_critical=0
 
 	# storcli absolute path
-	r_cli=/opt/storcli64
+	# use the old version if installed
+	if [[ -x /opt/storcli-1.15 ]]; then
+		# 1.15 works with 2.6.18 kernel (so I don't have to mess with MegaCLI, uff.)
+		r_cli=/opt/storcli-1.15
+	  else
+		r_cli=/opt/storcli64
+	fi
 	if [[ ! -x ${r_cli} ]]; then echo "${r_cli} not found, exiting" ; exit 2 ; fi
 
-	# use SHM in case the OS became RO
-	${r_cli} show >/dev/shm/.hwr_ctl.tmp
+	# use SHM in case the OS became RO, capture $r_cli for MegaCLI if needed
+	${r_cli} show >/dev/shm/.hwr_ctl.tmp; cli_ret=$?
 
 	# amount of RAID controllers
 	ctl_ids=$(cat /dev/shm/.hwr_ctl.tmp|awk '/^-------+$/ && a++ {next}; a == 2')
@@ -498,6 +504,35 @@ function check_zfs_pools() {
 	fi
 }
 
+function check_nvme() {
+
+	echo -n "[NVME]::"
+	# exclude fd, sr and ram devices to avoid timeout waits
+	nvme_devices=$(${bin_lsblk} -e 1,2,11 -nd --output NAME|grep ^nvme|sort -n)
+
+	while read -r current_nvme; do
+
+		${bin_nvme} smart-log /dev/${current_nvme} >/dev/shm/.nvme_cdrv
+
+		# https://nvmexpress.org/wp-content/uploads/NVM-Express-1_4-2019.06.10-Ratified.pdf 5.14.1.2
+		# cw - Critical Warning (>1)
+		# pu - Percentage USed (>95)
+		# me - Media Errors (>49)
+		s_cw=$(grep "^critical_warning\s" /dev/shm/.nvme_cdrv|awk '{print $NF}')
+		s_pu=$(grep "^percentage_used\s" /dev/shm/.nvme_cdrv|awk '{print $NF}'|cut -d'%' -f1)
+		s_me=$(grep "^media_errors\s" /dev/shm/.nvme_cdrv|awk '{print $NF}')
+
+		echo -n "drv:/dev/${current_nvme}:"
+
+		if [[ ${s_cw} -lt 2 ]] && [[ ${s_pu} -lt 95 ]] && [[ ${s_me} -lt 50 ]]; then
+			echo -n "Health OK (cw/pu/me: ${s_cw}/${s_pu}/${s_me});"
+		  else
+			echo -n "Health: CRITICAL ((cw/pu/me: ${s_cw}/${s_pu}/${s_me});"
+			let is_critical+=1
+		fi
+
+	done <<< "${nvme_devices}"
+}
 
 function check_drives() {
 	# smartctl shipped with CentOS 5.7 (ie vpsnode1) doesn't have --scan option
@@ -531,10 +566,62 @@ function check_drives() {
 		fi
 	fi
 
-	# check SMART 'Reallocated_Sector_Ct|Retired_Block_Count' value
+	# check SMART 0x05 value
 	function check_sattr() {
-		if [[ -z ${err_realloc} ]]; then err_realloc="S_NOATTR"; fi
+		if [[ -z ${err_realloc} ]]; then
+		
+			# query the device just once
+			${bin_smartctl} ${1} >/dev/shm/.drv_vendor
+			s_vendor=$(grep -P "^Vendor:\s" /dev/shm/.drv_vendor|awk '{print $NF}')
+
+			if [[ ! ${s_vendor} = "SEAGATE" ]]; then
+				s_vendor=$(grep -P "^Device Model:" /dev/shm/.drv_vendor|awk '{print $3}')
+			fi
+			
+			# identify Seagate
+			if [[ ${s_vendor} = "SEAGATE" ]]; then
+
+				# notify about alternative verification if it's other than Realloc counter test
+				verification_type=SGT
+
+				# switch SMART query to Health
+				new_query=$(echo ${1}|sed 's/-i/-H/g')
+
+				# get Seagate health status via 'SMART Health Status' since it lacks the usual values
+				sgt_health=$(${bin_smartctl} ${new_query}|grep "Health Status: "|awk -F": " '{print $NF}')
+
+				err_realloc="SEAGATE:${sgt_health}"
+				return 0
+			fi
+
+			# identify PNY
+			if [[ ${s_vendor} = "PNY" ]]; then
+			
+				verification_type=PNY
+
+				# switch SMART query to ALL
+				new_query=$(echo ${1}|sed 's/-i/-a/g')
+
+				# get PNY health status via SMART 231 attribute, the 'common' name for 231 is incorrect
+				# (https://www.smartmontools.org/ticket/1281) but the attribute itself is returning correct Life Left
+				# value, all PNY devices will be checked that way but the bug was found on PNY C900 model
+
+				pny_health=$(${bin_smartctl} ${new_query}|grep -P "^231\s"|awk '{print $NF}')
+
+				# Life Left, %
+				err_realloc="${pny_health}"
+				return 0
+			fi
+
+		 err_realloc="S_NOATTR"; fi
 	}
+
+	# smart 0x05 value is named differently depending on the drive model, define the names here to avoid
+	# long grep lines within 'current_drive'
+	s5_1=Reallocated_Sector_Ct
+	s5_2=Retired_Block_Count
+	# SSD
+	s5_3=Reallocate_NAND_Blk_Cnt
 
 	echo -n "[STORAGE]"
 	while read -r current_drive; do
@@ -545,8 +632,8 @@ function check_drives() {
 			is_smart=$(grep "SMART support is:\s*Disabled$" /dev/shm/.sw_smctl_dump.tmp|awk '{print $NF}')
 
 			if [[ -z "${is_smart}" ]]; then
-				err_realloc=$(${bin_smartctl} -d 3ware,${current_drive} -a /dev/tw?0|egrep '(Reallocated_Sector_Ct|Retired_Block_Count)'|awk '{print $NF}')
-				check_sattr
+				err_realloc=$(${bin_smartctl} -d 3ware,${current_drive} -a /dev/tw?0|egrep "(${s5_1}|${s5_2}|${s5_3})"|awk '{print $NF}')
+				check_sattr "-d 3ware,${current_drive} -i /dev/tw?0"
 			  else
 				err_realloc="SMART_disabled"
 			fi
@@ -557,8 +644,8 @@ function check_drives() {
 			is_smart=$(grep "SMART support is:\s*Disabled$" /dev/shm/.sw_smctl_dump.tmp|awk '{print $NF}')
 
 			if [[ -z "${is_smart}" ]]; then
-				err_realloc=$(${bin_smartctl} -a ${current_drive} |egrep '(Reallocated_Sector_Ct|Retired_Block_Count)'|awk '{print $NF}')
-				check_sattr
+				err_realloc=$(${bin_smartctl} -a ${current_drive} |egrep "(${s5_1}|${s5_2}|${s5_3})"|awk '{print $NF}')
+				check_sattr "-i ${current_drive}"
 			  else
 				err_realloc="SMART_disabled"
 			fi
@@ -574,8 +661,8 @@ function check_drives() {
 				if [[ ${sctl} = "Areca" ]]; then
 					err_realloc=$(echo $(smartctl -a ${current_drive} |egrep '(^read:|^write:)'|awk '{print $NF}')|sed 's/ /+/g'|bc)
 				  else
-					err_realloc=$(${bin_smartctl} -a ${current_drive} |egrep '(Reallocated_Sector_Ct|Retired_Block_Count)'|awk '{print $NF}')
-					check_sattr
+					err_realloc=$(${bin_smartctl} -a ${current_drive} |egrep "(${s5_1}|${s5_2}|${s5_3})"|awk '{print $NF}')
+					check_sattr "-i ${current_drive}"
 				fi
 			  else
 				err_realloc="SMART_disabled"
@@ -586,13 +673,50 @@ function check_drives() {
 
 		echo -n "drv:${current_drive}:"
 
-		if [[ ! ${err_realloc} -gt ${max_realloc_cnt} ]] && [[ -z "${is_smart}" ]]; then
-			echo -n "Health: OK (realloc: ${err_realloc});"
+		# Seagate health
+		if [[ ${verification_type} = "SGT" ]]; then
+
+			unset verification_type
+
+			if [[ "${err_realloc}" = "SEAGATE:OK" ]] && [[ -z "${is_smart}" ]]; then
+				echo -n "Health: OK (SMART Health status: ${err_realloc});"
+			  else
+			  	echo -n "Health: CRITICAL (SMART Health status: ${err_realloc});"
+				let is_critical=1
+			fi
+
+		# PNY health
+		  elif [[ ${verification_type} = "PNY" ]]; then
+
+			unset verification_type
+
+		  	if [[ ${err_realloc} -gt 0 ]] && [[ -z "${is_smart}" ]]; then
+			  	echo -n "Health: OK (231 (Life Left %): ${err_realloc});"
+			  else
+			  	echo -n "Health: CRITICAL (231 (Life Left %): ${err_realloc});"
+				let is_critical=1
+			fi
+
 		  else
-			echo -n "Health: CRITICAL (realloc: ${err_realloc});"
-			let is_critical+=1
+
+			# Generic verification
+			if [[ ! ${err_realloc} -gt ${max_realloc_cnt} ]] && [[ -z "${is_smart}" ]]; then
+				echo -n "Health: OK (realloc: ${err_realloc});"
+			  else
+				echo -n "Health: CRITICAL (realloc: ${err_realloc});"
+				let is_critical+=1
+			fi
 		fi
 	done <<< "${drive_ids}"
+
+	if [[ ${is_nvme} -eq 1 ]]; then
+
+		if [[ ! -x ${bin_nvme} ]]; then
+			echo "fatal: found NVMe storage but nvme tool not found on \$PATH, please install it, exiting" ; exit 2
+		fi
+
+		check_nvme
+	fi
 }
 
 function check_sw_raid_if_found() {
@@ -623,14 +747,24 @@ function nagios_states() {
 
 ## Main ##
 
-bin_lspci=$(which 2>/dev/null lspci)
-bin_zpool=$(which 2>/dev/null zpool)
+# sometimes non-root user's PATH is restricted to non-sbin dirs
+# and the root's $PATH isn't exported when invoked via sudo
+export PATH=$PATH:/sbin:/usr/sbin:/usr/local/sbin
+
+bin_lspci=$(which 2>/dev/null lspci) bin_lsblk=$(which 2>/dev/null lsblk)
+bin_zpool=$(which 2>/dev/null zpool) bin_nvme=$(which 2>/dev/null nvme)
 
 max_realloc_cnt=49
 max_media_err_cnt=49
 
 if [[ ! -x ${bin_lspci} ]]; then
-        echo "fatal: unable to find lspci tool on $PATH, please install it, exiting" ; exit 2
+        echo "fatal: unable to find lspci tool on \$PATH, please install it, exiting" ; exit 2
+fi
+
+if [[ ! -x ${bin_lsblk} ]]; then
+		#echo "fatal: unable to find lsblk tool on \$PATH, please install it, exiting" ; exit 2
+		# there's number of problems with lsblk on centos 4/5, attempt to check manually if missing
+		hw_nvme=$(for n in $(find /sys/block -maxdepth 1|grep /nvme); do basename ${n};done |grep -Pql "^nvme";echo $?)
 fi
 
 sw_arrays=$(grep -o "^md[_,a-z,0-9]*" /proc/mdstat)
@@ -638,6 +772,16 @@ bin_smartctl=$(which 2>/dev/null smartctl)
 if [[ -z ${bin_smartctl} ]]; then
 	echo "smartctl missing, exiting" ; exit 1
 fi
+
+# detect NVMe drives via lsblk
+if [[ -x ${bin_lsblk} ]]; then
+	hw_nvme=$(${bin_lsblk} -nd --output name|grep -Pql ^nvme;echo $?)
+fi
+
+if [[ ${hw_nvme} -eq 0 ]]; then
+	is_nvme=1
+fi
+
 if [[ ! -z ${sw_arrays} ]]; then
 
 	bin_mdadm=$(which 2>/dev/null mdadm)
@@ -655,7 +799,7 @@ if [[ ${hw_card_present} -gt 0 ]]; then
 
 	hw_card_model=$(${bin_lspci} |grep RAID|grep Intel -v|head -1|awk '{print $5}')
 
-	if [[ ${hw_card_model} = "LSI" ]]; then
+	if [[ ${hw_card_model} = "LSI" ]] || [[ ${hw_card_model} = "Broadcom" ]]; then
 		lsi_hw_raid_check
 		   hw_errcnt=${is_critical}
 		# LSI on some hosts require '-d megaraid,N' for smartctl
@@ -693,7 +837,7 @@ if [[ ${hw_card_present} -gt 0 ]]; then
 
 		bin_p2g=$(which 2>/dev/null pcre2grep)
 		if [[ ! -x ${bin_p2g} ]]; then
-		        echo "fatal: unable to find pcre2grep tool on $PATH, please install it, exiting" ; exit 2
+		        echo "fatal: unable to find pcre2grep tool on \$PATH, please install it, exiting" ; exit 2
 		  else
 			adaptec_hw_raid_check
 			   hw_errcnt=${is_critical}
