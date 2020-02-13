@@ -1,6 +1,20 @@
 ## STORAGE monitoring plugin for nagios
 
 
+#### What's new:
+
+> ####  13-02-2020
+######   - Reported LSI/Broadcom identification issue has been corrected
+
+######   - Some Seagate models provide very limited S.M.A.R.T. attributes which caused the check to be skipped, this is now supported,  NOTE: Health check for such models is based on 'SMART Health Status' return value, while it's not the best way, there's nothing better available at the moment
+
+######   - NVMe storages are now supported
+
+######   - small fixes
+
+#
+##### What it does:
+
 ###### This plugin will monitor health & missing components of:
 
 ###### -  Hardware RAID (supported RAID controllers: LSI, 3ware, Areca, Adaptec):
@@ -12,7 +26,6 @@
 ###### -  ZFS pools
 
 ###### -  It will also monitor all the drives (via smartctl) detected in non-RAID / non-ZFS (or mixed) enviroments.
-
 
 
 ##### What's required:
