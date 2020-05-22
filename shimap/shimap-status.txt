@@ -1,0 +1,1 @@
+shimap - console based IMAP client with dialog UI, coming soon
